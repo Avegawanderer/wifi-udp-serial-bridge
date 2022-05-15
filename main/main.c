@@ -14,30 +14,16 @@
 #include "lwip/sys.h"
 
 #include "xfifo.h"
+#include "config.h"
+#include "drv_led.h"
 
-static const char *TAG = "wifi softAP";
+static const char *TAG = "WiFi softAP";
 static const char *TELEM_TAG = "Telemetry server";
 static const char *CONFIG_TAG = "Config server";
 
-#define ESP_WIFI_SSID      "esp32_wifi"
-#define ESP_WIFI_PASS      "11112222"
-#define ESP_WIFI_CHANNEL   1
-#define MAX_STA_CONN       5
-
-const uint8_t myIp[4] =     {192, 168, 1, 10};
-const uint8_t gwIp[4] =     {192, 168, 1, 1};
-const uint8_t netMask[4] =  {255, 255, 255, 0};
-
-#define TELEMETRY_PORT      3151
-#define CONFIG_PORT         3140
-
-#define TELEMETRY_UART      UART_NUM_2
-#define TELEMETRY_RX_PIN    16
-#define TELEMETRY_TX_PIN    17
-
-#define AAT_UART            UART_NUM_1
-#define AAT_RX_PIN          18
-#define AAT_TX_PIN          19
+const uint8_t myIp[4] = IP_ADDR_MY;
+const uint8_t gwIp[4] = IP_ADDR_GW;
+const uint8_t netMask[4] = NET_MASK;
 
 xFifo_t smartPortDownlinkFifo;      // R9M -> UART -> UDP -> Ground Station
 //xFifo_t smartPortUplinkFifo;        // Ground Station -> UDP -> UART -> R9M (not used at the moment)
@@ -45,11 +31,180 @@ xFifo_t smartPortDownlinkFifo;      // R9M -> UART -> UDP -> Ground Station
 //xFifo_t configDownlinkFifo;         // AAT -> UART -> UDP -> Configurator
 //xFifo_t configUplinkFifo;           // Configurator -> UDP -> UART -> AAT
 
-#define AAT_CONFIG_TIMEOUT  2000    // When configuration becomes active, telemetry stream is disabled for this time [ms]
-
 int aatConfigMode;
 int aatConfigModeTimer;
+int telemetryTimeoutTimer;
 
+// LED indication types
+typedef enum {
+    LedIndic_Off,
+    LedIndic_On,
+    LedIndic_Blink,
+} LedIndication;
+
+#define LED_INDIC_FSM_CALL_PERIOD       2      // [ms]
+#define TELEMETRY_TIMEOUT               1000    // [s]
+
+static struct ldi_s {
+    struct {
+        LedIndication indicationType;
+        uint8_t numRepeats;
+        uint16_t timeOn;
+        uint16_t timeOff;
+        uint8_t state;
+        uint16_t tmr;
+    } leds[LedCount];
+} ldi, altLdi;
+static bool isAltLdi;
+
+
+
+/**
+    @brief  Provide indication by LEDs
+    @param[in]  led Led to use
+    @param[in]  indicationType Desired indication type
+    @param[in]  timeOn Time [ms] for ON state (blink indication type only). May be 0 for ON or OFF indication
+    @param[in]  timeOff Time [ms] for OFF state (blink indication type only). May be 0 for ON or OFF indication
+    @param[in]  numRepeats Number of blinks. If set to 0, LED will blink until other indication type is set.
+                Otherwise LED will blink numRepeats times and then switch to OFF state
+    @return None
+*/
+void putLedIndication(Leds led, LedIndication indicationType, uint16_t timeOn, uint16_t timeOff, uint8_t numRepeats)
+{
+    ldi.leds[led].indicationType = indicationType;
+    ldi.leds[led].numRepeats = numRepeats;
+    ldi.leds[led].timeOn = timeOn / LED_INDIC_FSM_CALL_PERIOD;
+    ldi.leds[led].timeOff = timeOff / LED_INDIC_FSM_CALL_PERIOD;
+    ldi.leds[led].state = 0;
+    ldi.leds[led].tmr = 1;      // Update state on next FSM call
+
+    if (indicationType == LedIndic_On)
+    {
+        ldi.leds[led].state = 1;
+        if (!isAltLdi)
+            drvLed_Set(led, On);
+    }
+    else if (indicationType == LedIndic_Off)
+    {
+        ldi.leds[led].state = 0;
+        if (!isAltLdi)
+            drvLed_Set(led, Off);
+    }
+    else
+    {
+        // Blink will be processed by FSM
+    }
+}
+
+
+/**
+    @brief  Provide alternative indication by LEDs
+    @param[in]  led Led to use
+    @param[in]  indicationType Desired indication type
+    @param[in]  timeOn Time [ms] for ON state (blink indication type only). May be 0 for ON or OFF indication
+    @param[in]  timeOff Time [ms] for OFF state (blink indication type only). May be 0 for ON or OFF indication
+    @param[in]  numRepeats Number of blinks. If set to 0, LED will blink until other indication type is set.
+                Otherwise LED will blink numRepeats times and then switch to main indication
+    @return None
+*/
+void putAltLedIndication(Leds led, LedIndication indicationType, uint16_t timeOn, uint16_t timeOff, uint8_t numRepeats)
+{
+    altLdi.leds[led].indicationType = indicationType;
+    altLdi.leds[led].numRepeats = numRepeats;
+    altLdi.leds[led].timeOn = timeOn / LED_INDIC_FSM_CALL_PERIOD;
+    altLdi.leds[led].timeOff = timeOff / LED_INDIC_FSM_CALL_PERIOD;
+    altLdi.leds[led].state = 0;
+    altLdi.leds[led].tmr = 1;       // Update state on next FSM call
+    if (indicationType == LedIndic_On)
+    {
+        drvLed_Set(led, On);
+        isAltLdi = true;                // Switch to alternative structure
+    }
+    else if (indicationType == LedIndic_Off)
+    {
+        drvLed_Set(led, (ldi.leds[led].state) ? On : Off);
+        isAltLdi = false;               // Switch to main structure
+    }
+    else
+    {
+        isAltLdi = true;                // Switch to alternative structure
+        // Blink will be processed by FSM
+    }
+}
+
+
+/**
+    @brief  Process indication by LEDs
+            Must be called periodically
+    @param doApply if set to True, LED driver is set to LED state
+    @return None
+*/
+static void ProcessLedIndication(bool doApply)
+{
+    uint8_t i;
+    struct ldi_s *pLdi = (isAltLdi) ? &altLdi : &ldi;
+
+    for (i = 0; i < LedCount; i++)
+    {
+        if ((pLdi->leds[i].indicationType == LedIndic_Blink))
+        {
+            if (--pLdi->leds[i].tmr == 0)
+            {
+                while (1)
+                {
+                    if (pLdi->leds[i].state == 0)
+                    {
+                        drvLed_Set((Leds)i, On);
+                        pLdi->leds[i].state = 1;
+                        pLdi->leds[i].tmr = pLdi->leds[i].timeOn;
+                        break;
+                    }
+                    else if (pLdi->leds[i].state == 1)
+                    {
+                        drvLed_Set((Leds)i, Off);
+                        pLdi->leds[i].state = 2;
+                        pLdi->leds[i].tmr = pLdi->leds[i].timeOff;
+                        break;
+                    }
+                    else // (pLdi->leds[i].state == 2)
+                    {
+                        if ((pLdi->leds[i].numRepeats > 0) && (--pLdi->leds[i].numRepeats == 0))
+                        {
+                            pLdi->leds[i].indicationType = LedIndic_Off;
+                            drvLed_Set((Leds)i, Off);
+                            pLdi->leds[i].state = 0;
+                            if (isAltLdi)
+                            {
+                                isAltLdi = false;
+                                ProcessLedIndication(true);
+                            }
+                            break;
+                        }
+                        else
+                        {
+                            pLdi->leds[i].state = 0;
+                        }
+                    }
+                }
+            }
+        }
+        if (doApply)
+        {
+            drvLed_Set((Leds)i, (pLdi->leds[i].state) ? On : Off);
+        }
+    }
+}
+
+
+static void activity_indication_task(void *pvParameters)
+{
+    drvLed_Init();
+    while(1)
+    {
+        ProcessLedIndication(false);
+        vTaskDelay(LED_INDIC_FSM_CALL_PERIOD / portTICK_PERIOD_MS);
+    }
+}
 
 
 static void setupTelemetryUart(void)
@@ -93,33 +248,6 @@ static void setupAatUart(void)
     const int uart_buffer_size = (1024 * 2);
     // Install UART driver using an event queue here
     ESP_ERROR_CHECK(uart_driver_install(uart_num, uart_buffer_size, uart_buffer_size, 10, 0, 0));
-}
-
-
-static void activity_indication_task(void *pvParameters)
-{
-    // Indication:
-    //  1. Telemetry input
-    //  2. AAT UART mode: telemetry / configuration
-    //  2. AAT UART TX
-    //  3. AAT UART RX
-    while(1)
-    {
-        vTaskDelay(3 / portTICK_PERIOD_MS);
-
-    }
-}
-
-
-static void indicate_activity(int source)
-{
-
-}
-
-
-static void set_static_indication(int source, int state)
-{
-
 }
 
 
@@ -320,7 +448,13 @@ static void config_server_task(void *pvParameters)
                         ESP_LOGI(CONFIG_TAG, "downlink %u bytes", len);
                     }
                     // Disable telemetry UART sending to AAT
-                    aatConfigMode = 1;
+                    if (aatConfigMode == 0)
+                    {
+                        aatConfigMode = 1;
+                        putLedIndication(AatModeTelemLed, LedIndic_Off, 0, 0, 0);
+                        putLedIndication(AatModeConfigLed, LedIndic_On, 0, 0, 0);
+                    }
+                    putAltLedIndication(AatModeConfigLed, LedIndic_Blink, 10, 40, 1);
                     aatConfigModeTimer = AAT_CONFIG_TIMEOUT;
                 }
             }
@@ -352,13 +486,17 @@ static void config_server_task(void *pvParameters)
                         ESP_LOGI(CONFIG_TAG, "Client address: %s", addrStr);
                     }
                     // Disable telemetry UART sending to AAT
-                    aatConfigMode = 1;
+                    if (aatConfigMode == 0)
+                    {
+                        aatConfigMode = 1;
+                        putLedIndication(AatModeTelemLed, LedIndic_Off, 0, 0, 0);
+                        putLedIndication(AatModeConfigLed, LedIndic_On, 0, 0, 0);
+                    }
+                    putAltLedIndication(AatModeConfigLed, LedIndic_Blink, 10, 40, 1);
                     aatConfigModeTimer = AAT_CONFIG_TIMEOUT;
 
                     //xFifo_Put(&configUplinkFifo, tmpBuffer, len);
                     uart_write_bytes(AAT_UART, tmpBuffer, len);
-
-
                 }
             }
 
@@ -369,6 +507,8 @@ static void config_server_task(void *pvParameters)
                 if (aatConfigModeTimer <= 0)
                 {
                     aatConfigMode = 0;
+                    putLedIndication(AatModeTelemLed, LedIndic_On, 0, 0, 0);
+                    putLedIndication(AatModeConfigLed, LedIndic_Off, 0, 0, 0);
                 }
             }
 
@@ -397,12 +537,17 @@ static void telemetry_mux_task(void *pvParameters)
             int len = (availCnt > bufSize) ? bufSize : availCnt;
             uart_read_bytes(TELEMETRY_UART, tmpBuffer, len, 0);
 
+            // Indicate
+            telemetryTimeoutTimer = 0;
+            putAltLedIndication(TelemLed, LedIndic_Blink, 10, 40, 1);
+
             // Output to PC
             xFifo_Put(&smartPortDownlinkFifo, tmpBuffer, len);
 
             // Output to AAT UART (disabled during configuration of AAT)
             if (aatConfigMode == 0)
             {
+                putAltLedIndication(AatModeTelemLed, LedIndic_Blink, 10, 40, 1);
                 uart_write_bytes(AAT_UART, tmpBuffer, len);
             }
         }
@@ -424,6 +569,7 @@ void app_main(void)
 
     aatConfigMode = 0;
     aatConfigModeTimer = 0;
+    telemetryTimeoutTimer = 0;
 
     //-----------------------------------------------------------------------//
 
@@ -439,8 +585,10 @@ void app_main(void)
     IP4_ADDR(&ip_info.gw, gwIp[0], gwIp[1], gwIp[2], gwIp[3]);
     IP4_ADDR(&ip_info.netmask, netMask[0], netMask[1], netMask[2], netMask[3]);
     ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &ip_info));
-    //ESP_ERROR_CHECK(esp_netif_dhcps_start(netif));              // If sending socket is bound to INADDR_ANY and DHCP is disabled,
-                                                                  // sending broadcast packets to 255.255.255.255 fails with EHOSTUNREACH (errno 118)
+#if ENA_DHCP == 1
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(netif));              // If sending socket is bound to INADDR_ANY and DHCP is disabled,
+                                                                // sending broadcast packets to 255.255.255.255 fails with EHOSTUNREACH (errno 118)
+#endif
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -475,34 +623,33 @@ void app_main(void)
     xTaskCreate(telemetry_server_task, "telemetry_server", 4096, 0, 4, NULL);
     xTaskCreate(config_server_task, "config_server", 4096, 0, 5, NULL);
     xTaskCreate(telemetry_mux_task, "telemetry_mux", 4096, 0, 6, NULL);        // Must have priority higher than config_server
-    xTaskCreate(activity_indication_task, "indication", 1024, 0, 2, NULL);
+    xTaskCreate(activity_indication_task, "indication", 4096, 0, 2, NULL);
 
     //-----------------------------------------------------------------------//
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    putLedIndication(AatModeTelemLed, LedIndic_On, 0, 0, 0);
+    putLedIndication(TelemLed, LedIndic_Blink, 1000, 1000, 0);
 
     //uint8_t i = 0;
     //char tmpBuffer[20];
 
-    //zero-initialize the config structure.
-	gpio_config_t io_conf = {};
-	//disable interrupt
-	io_conf.intr_type = GPIO_INTR_DISABLE;
-	//set as output mode
-	io_conf.mode = GPIO_MODE_OUTPUT;
-	//bit mask of the pins that you want to set,e.g.GPIO18/19
-	io_conf.pin_bit_mask = GPIO_SEL_2;
-	//disable pull-down mode
-	io_conf.pull_down_en = 0;
-	//disable pull-up mode
-	io_conf.pull_up_en = 0;
-	//configure GPIO with the given settings
-	gpio_config(&io_conf);
-
     while(1)
     {
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-        gpio_set_level(GPIO_NUM_2, 1);
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-        gpio_set_level(GPIO_NUM_2, 0);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        if (telemetryTimeoutTimer < TELEMETRY_TIMEOUT)
+        {
+            telemetryTimeoutTimer += 100;
+            if (telemetryTimeoutTimer >= TELEMETRY_TIMEOUT)
+            {
+                //putLedIndication(TelemLed, LedIndic_Blink, 1000, 1000, 0);
+            }
+        }
+
+
+        //gpio_set_level(GPIO_NUM_2, 1);
+        //vTaskDelay(500 / portTICK_PERIOD_MS);
+        //gpio_set_level(GPIO_NUM_2, 0);
 
         // Test output to PC
         //sprintf(tmpBuffer, "Test data %d", i++);
